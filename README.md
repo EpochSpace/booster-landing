@@ -1,5 +1,7 @@
 # booster-landing
 
+![Closed-loop powered descent from 500 m: side view of the booster on its SCvx plan, with altitude, velocity, thrust and attitude traces, ending in a 0.16 m touchdown](docs/landing.gif)
+
 A propulsive landing simulation in the SpaceX mould: convex-optimization powered
 descent guidance, flown closed loop through a 6-DoF rigid-body plant, replayed
 in real time as a 2D side view with the landing pad and the booster itself.
