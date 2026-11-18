@@ -1,0 +1,171 @@
+diff --git a/core/main.c b/core/main.c
+index 50120ae..3adad2c 100644
+--- a/core/main.c
++++ b/core/main.c
+@@ -517,6 +517,9 @@ static int cmd_run(int argc, char** argv){
+     const char* policy_log=0;                    /* N1 S0 teacher tap (--policy-log; NULL => OFF => byte-identical) */
+     for(int i=2;i<argc;i++){
+         if(!strcmp(argv[i],"--scenario")&&i+1<argc){ scen=scenario_from_name(argv[++i]); if(scen<0)scen=SCEN_TERMINAL; }
++        /* booster-landing RTLS patch: initial conditions for SCEN_CUSTOM, including the
++         * horizontal velocity no shipped scenario could express. See core/scenario.h. */
++        else if(!strcmp(argv[i],"--custom")&&i+1<argc){ if(!scenario_set_custom(argv[++i])){ fprintf(stderr,"error: --custom: bad spec (keys: h0 vz0 vx0 lateral prop0 tilt0 uref deck w20 fins retro)\n"); return 2; } scen=SCEN_CUSTOM; }
+         else if(!strcmp(argv[i],"--seed")&&i+1<argc) seed=(uint32_t)strtoul(argv[++i],0,10);
+         else if(!strcmp(argv[i],"--run")&&i+1<argc) run=(uint32_t)strtoul(argv[++i],0,10);
+         else if(!strcmp(argv[i],"--policy-log")&&i+1<argc) policy_log=argv[++i];  /* N1 S0 (o,a*) tap path */
+@@ -616,6 +619,9 @@ static int cmd_headless(int argc, char** argv){
+     const char* policy_log=0;                    /* N1 S0 teacher tap (--policy-log; NULL => OFF => byte-identical) */
+     for(int i=2;i<argc;i++){
+         if(!strcmp(argv[i],"--scenario")&&i+1<argc){ scen=scenario_from_name(argv[++i]); if(scen<0)scen=SCEN_TERMINAL; }
++        /* booster-landing RTLS patch: initial conditions for SCEN_CUSTOM, including the
++         * horizontal velocity no shipped scenario could express. See core/scenario.h. */
++        else if(!strcmp(argv[i],"--custom")&&i+1<argc){ if(!scenario_set_custom(argv[++i])){ fprintf(stderr,"error: --custom: bad spec (keys: h0 vz0 vx0 lateral prop0 tilt0 uref deck w20 fins retro)\n"); return 2; } scen=SCEN_CUSTOM; }
+         else if(!strcmp(argv[i],"--seed")&&i+1<argc) seed=(uint32_t)strtoul(argv[++i],0,10);
+         else if(!strcmp(argv[i],"--runs")&&i+1<argc) runs=strtol(argv[++i],0,10);
+         else if(!strcmp(argv[i],"--out")&&i+1<argc) out=argv[++i];
+diff --git a/core/scenario.c b/core/scenario.c
+index ca36977..f2841d2 100644
+--- a/core/scenario.c
++++ b/core/scenario.c
+@@ -5,21 +5,58 @@
+ #include "rng.h"
+ #include <string.h>
+ #include <math.h>
++#include <stdlib.h>
+ 
+ typedef struct {
+     const char* name;
+-    double h0, vz0, lateral, prop0, tilt0, u_ref, deck_z; int w20; int fins;
++    /* vx0: initial horizontal velocity along +x [m/s]. Added by the booster-landing RTLS
++     * patch; every shipped scenario leaves it 0 and is bit-identical as a result. A stage
++     * arriving at the entry interface after a boostback burn is the only case that needs it. */
++    double h0, vz0, vx0, lateral, prop0, tilt0, u_ref, deck_z; int w20; int fins;
++    int retro;        /* 1 => initial attitude along -v (engines first), not near-vertical */
+ } ScenDef;
+ 
+ static const ScenDef DEFS[SCEN_COUNT] = {
+- /* name           h0     vz0    lat    prop0   tilt0        uref deck w20 fins */
+- {"terminal",     2000,  -180,    0,    8500,  3*DEG2RAD,    3.0, 0,  15, 0},
+- {"aero_offset", 12000,  -330,  500,   10000,  5*DEG2RAD,    6.0, 0,  30, 1},
+- {"entry",       62000, -1500, 3000,   30000,  6*DEG2RAD,    8.0, 0,  30, 1},
+- {"asds_night",  12000,  -330,  800,   10000,  5*DEG2RAD,    8.0, 0,  30, 1},
+- {"chaos",        9000,  -250,  600,    9000,  8*DEG2RAD,   12.0, 0,  45, 1},
++ /* name           h0     vz0  vx0    lat    prop0   tilt0        uref deck w20 fins retro */
++ {"terminal",     2000,  -180,  0,     0,    8500,  3*DEG2RAD,    3.0, 0,  15, 0, 0},
++ {"aero_offset", 12000,  -330,  0,   500,   10000,  5*DEG2RAD,    6.0, 0,  30, 1, 0},
++ {"entry",       62000, -1500,  0,  3000,   30000,  6*DEG2RAD,    8.0, 0,  30, 1, 0},
++ {"asds_night",  12000,  -330,  0,   800,   10000,  5*DEG2RAD,    8.0, 0,  30, 1, 0},
++ {"chaos",        9000,  -250,  0,   600,    9000,  8*DEG2RAD,   12.0, 0,  45, 1, 0},
++ /* "custom" is a placeholder until scenario_set_custom() overwrites it from the command
++  * line; the defaults below are the entry interface of an RTLS return. */
++ {"custom",      70000, -1360, -205, 9000,  29000,  2*DEG2RAD,    8.0, 0,  30, 1, 1},
+ };
+ 
++/* The one mutable scenario. scenario_init reads this instead of DEFS[SCEN_CUSTOM]. */
++static ScenDef CUSTOM = {"custom", 70000,-1360,-205,9000,29000, 2*DEG2RAD, 8.0,0, 30,1,1};
++
++int scenario_set_custom(const char* spec){
++    if(!spec) return 0;
++    char buf[1024]; size_t n=strlen(spec);
++    if(n>=sizeof(buf)) return 0;
++    memcpy(buf,spec,n+1);
++    for(char* tok=strtok(buf,",");tok;tok=strtok(0,",")){
++        char* eq=strchr(tok,'=');
++        if(!eq) return 0;
++        *eq=0;
++        const char* k=tok; double v=strtod(eq+1,0);
++        if(!strcmp(k,"h0"))           CUSTOM.h0=v;
++        else if(!strcmp(k,"vz0"))     CUSTOM.vz0=v;
++        else if(!strcmp(k,"vx0"))     CUSTOM.vx0=v;
++        else if(!strcmp(k,"lateral")) CUSTOM.lateral=v;
++        else if(!strcmp(k,"prop0"))   CUSTOM.prop0=v;
++        else if(!strcmp(k,"tilt0"))   CUSTOM.tilt0=v*DEG2RAD;
++        else if(!strcmp(k,"uref"))    CUSTOM.u_ref=v;
++        else if(!strcmp(k,"deck"))    CUSTOM.deck_z=v;
++        else if(!strcmp(k,"w20"))     CUSTOM.w20=(int)v;
++        else if(!strcmp(k,"fins"))    CUSTOM.fins=(int)v;
++        else if(!strcmp(k,"retro"))   CUSTOM.retro=(int)v;
++        else return 0;
++    }
++    return 1;
++}
++
+ const char* scenario_name(int s){ return (s>=0&&s<SCEN_COUNT)?DEFS[s].name:"?"; }
+ int scenario_from_name(const char* s){
+     for(int i=0;i<SCEN_COUNT;i++) if(strcmp(s,DEFS[i].name)==0) return i;
+@@ -33,7 +70,7 @@ static double disp(uint32_t seed, uint32_t run, uint32_t field, double sigma){
+ 
+ void scenario_init(State* st, int scen, uint32_t seed, uint32_t run_idx, ScenarioEnv* se){
+     if(scen<0||scen>=SCEN_COUNT) scen=SCEN_TERMINAL;
+-    const ScenDef* d=&DEFS[scen];
++    const ScenDef* d = (scen==SCEN_CUSTOM) ? &CUSTOM : &DEFS[scen];
+     memset(st,0,sizeof(*st));
+     q_identity(&st->y[S_QX]);
+ 
+@@ -58,7 +95,9 @@ void scenario_init(State* st, int scen, uint32_t seed, uint32_t run_idx, Scenari
+     st->y[S_RX]=lx; st->y[S_RY]=ly; st->y[S_RZ]=h0 + mp.com;
+ 
+     double vz0 = d->vz0 + disp(seed,run_idx,4, (scen==SCEN_TERMINAL?12.0:20.0));
+-    st->y[S_VX]=disp(seed,run_idx,5, 5.0);
++    /* vx0 is 0 for every shipped scenario, so the +-5 m/s dispersion is all that is left
++     * and this line is bit-identical to what it replaced. */
++    st->y[S_VX]=d->vx0 + disp(seed,run_idx,5, 5.0);
+     st->y[S_VY]=disp(seed,run_idx,6, 5.0);
+     st->y[S_VZ]=vz0;
+ 
+@@ -66,6 +105,23 @@ void scenario_init(State* st, int scen, uint32_t seed, uint32_t run_idx, Scenari
+     double tilt = fabs(d->tilt0 + disp(seed,run_idx,7, 2*DEG2RAD));
+     double az = 6.2831853*rng_u01((uint32_t)(seed+run_idx*2654435761u));
+     double zt[3]={sin(tilt)*cos(az), sin(tilt)*sin(az), cos(tilt)};
++    if(d->retro){
++        /* A stage arriving from a boostback is flying engines-first along its own
++         * retrograde, not hanging near-vertical: with vx=-205 and vz=-1360 that is 8.6 deg
++         * off vertical, well outside the +-2 deg the shipped scenarios assume. Point the
++         * body +z along -v and apply the tilt error on top of it. */
++        double vx=st->y[S_VX], vy=st->y[S_VY], vz=st->y[S_VZ];
++        double sp=sqrt(vx*vx+vy*vy+vz*vz);
++        if(sp>1e-6){
++            double rx=-vx/sp, ry=-vy/sp, rz=-vz/sp;
++            /* rotate the retrograde axis by `tilt` about an arbitrary perpendicular */
++            double px=-ry, py=rx, pz=0.0, pm=sqrt(px*px+py*py);
++            if(pm<1e-9){ px=1.0; py=0.0; pm=1.0; }
++            px/=pm; py/=pm;
++            double ct=cos(tilt), stt=sin(tilt);
++            zt[0]=ct*rx+stt*px; zt[1]=ct*ry+stt*py; zt[2]=ct*rz+stt*pz;
++        }
++    }
+     double zb[3]={0,0,1}, qtilt[4]; q_from_two_vec(qtilt,zb,zt); q_copy(&st->y[S_QX],qtilt);
+ 
+     st->y[S_WX]=disp(seed,run_idx,8, 0.02);
+diff --git a/core/scenario.h b/core/scenario.h
+index 71332dd..512c38d 100644
+--- a/core/scenario.h
++++ b/core/scenario.h
+@@ -4,7 +4,8 @@
+ #include "state.h"
+ #include <stdint.h>
+ 
+-enum { SCEN_TERMINAL=0, SCEN_AERO_OFFSET=1, SCEN_ENTRY=2, SCEN_ASDS_NIGHT=3, SCEN_CHAOS=4, SCEN_COUNT };
++enum { SCEN_TERMINAL=0, SCEN_AERO_OFFSET=1, SCEN_ENTRY=2, SCEN_ASDS_NIGHT=3, SCEN_CHAOS=4,
++       SCEN_CUSTOM=5, SCEN_COUNT };
+ 
+ typedef struct {
+     double u_ref;     /* mean wind at 10 m (m/s) */
+@@ -15,6 +16,18 @@ typedef struct {
+ 
+ const char* scenario_name(int scen);
+ int scenario_from_name(const char* s);
++
++/* --- RTLS handover patch (booster-landing) ------------------------------------------------
++ * The shipped scenarios all start with essentially zero horizontal velocity: scenario_init
++ * gives S_VX/S_VY a +-5 m/s dispersion and nothing else. A stage handed over at the entry
++ * interface after a boostback burn is still flying back towards the pad at a couple of
++ * hundred m/s, so there was no way to express its initial state. SCEN_CUSTOM adds one
++ * scenario whose initial conditions -- including that horizontal velocity -- come from the
++ * command line: `--custom "h0=70000,vx0=-205,vz0=-1360,lateral=9083,prop0=29067,retro=1"`.
++ * Keys: h0 vz0 vx0 lateral prop0 tilt0 uref deck w20 fins retro. Returns 0 on a bad spec.
++ * `retro=1` points the stage along its own retrograde velocity instead of near-vertical,
++ * which is the attitude a returning booster actually arrives in. */
++int scenario_set_custom(const char* spec);
+ /* Initialize state + environment for (scenario, seed, run_idx). run_idx=0 => nominal (no dispersion). */
+ void scenario_init(State* st, int scen, uint32_t seed, uint32_t run_idx, ScenarioEnv* se);
+ 

@@ -1,0 +1,14 @@
+# Visualisation and build tooling for the C++ guidance core.
+rerun-sdk>=0.37
+numpy>=2.0
+cmake>=3.24
+ninja>=1.11
+
+# Only needed to run external/SCvx (the Python reference implementation of the
+# same algorithm). ecos is not pulled in by cvxpy any more, but SCvx asks for it
+# by name in global_parameters.py.
+cvxpy>=1.9
+ecos>=2.0.14
+sympy>=1.12
+scipy>=1.11
+matplotlib>=3.8

@@ -1,0 +1,1092 @@
+% Compile with:  pdflatex model.tex   (twice, for the table of contents)
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=25mm]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\vect}[1]{\mathbf{#1}}
+\newcommand{\quat}[1]{\mathbf{#1}}
+\newcommand{\dd}{\mathrm{d}}
+\newcommand{\Rot}{\vect{C}}
+\newcommand{\eh}{\hat{\vect{e}}_h}
+\newcommand{\ec}{\hat{\vect{e}}_c}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{Booster Landing Simulation:\\Mathematical Model as Implemented}
+\author{Generated from the source of \code{booster-landing}}
+\date{Revision of the working tree, \today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document states the equations actually implemented in the
+\code{booster-landing} repository, for external review. It is written from the
+source, not from intent: where a code comment disagrees with the code, the code
+is described and the discrepancy is flagged. Sections~\ref{sec:vehicle}
+to~\ref{sec:closedloop} cover the C\texttt{++} guidance and plant taken
+unmodified from \code{external/pdg}; Section~\ref{sec:donor} covers the
+reconstruction layer this project adds on top of the donor simulator, which is
+where most of the modelling risk sits; Section~\ref{sec:projection} covers the
+projection used for display. Section~\ref{sec:limits} lists the assumptions and
+open questions that most deserve scrutiny.
+\end{abstract}
+
+\tableofcontents
+
+\section{Scope and conventions}
+
+\subsection{What is and is not modelled here}
+
+Two independent simulators feed one telemetry format.
+
+\begin{description}
+\item[\code{external/pdg}] Convex-optimisation powered descent guidance and a
+  6-DoF rigid-body plant, in C\texttt{++}. Thrust and gravity only: there is no
+  atmosphere, no aerodynamics and no contact model. Used unmodified.
+\item[\code{external/booster-lander-simulator}] A C11 core with a US76
+  atmosphere, body and grid-fin aerodynamics and leg contact, which flies the
+  full return from stage separation. Used unmodified, as an executable; its
+  internal equations are documented in its own repository and are \emph{not}
+  restated here. What is restated is every quantity this project reconstructs
+  from its output, in Section~\ref{sec:donor}.
+\end{description}
+
+\begin{description}
+\item[\code{bridge/rtls\_trajectory.py}] Written for this project, in Python: a
+  planar round-Earth point-mass model with a US76 atmosphere, which flies the
+  solo first stage from liftoff through engine cutoff, the boostback burn and
+  the ballistic coast, down to the entry interface at $65$~km. Its equations are
+  given in full in Section~\ref{sec:rtls}. Below the entry interface it hands
+  the flight to the donor.
+\end{description}
+
+\code{external/} carries \textbf{one} edit, and it is the subject of
+Section~\ref{sec:donorpatch}: a \code{custom} scenario in the donor's
+\code{core/scenario.c}, plus the \code{vx0} field it needs, because no shipped
+scenario could express a stage that is still flying horizontally when it arrives.
+Every shipped scenario is bit-identical under it. Nothing else in
+\code{external/} is touched.
+
+The producers are never mixed into a single plant; each writes the same
+telemetry file format independently, and a handover between two of them is a
+state vector, not a splice of equations of motion.
+
+\subsection{Frames and notation}
+
+The inertial frame is right-handed with $\hat{\vect{z}}$ up and the landing
+target at the origin. The body frame has $\hat{\vect{z}}_B$ along the vehicle's
+long axis, pointing from the engine toward the nose.
+
+Quaternions are scalar-first, $\quat{q}=(q_0,q_1,q_2,q_3)$, unit norm, and map
+body to inertial: $\vect{x}_I=\Rot(\quat{q})\,\vect{x}_B$. The product
+$\otimes$ is the Hamilton product. $\vect{g}=(0,0,-g_0)$ with
+$g_0=9.80665\ \mathrm{m/s^2}$.
+
+SI units throughout: metres, seconds, kilograms, newtons, radians (degrees only
+where a parameter is exposed in degrees).
+
+\section{Vehicle model}
+\label{sec:vehicle}
+
+\subsection{State and control}
+
+The state has dimension 14 and the control dimension 3:
+\begin{equation}
+\vect{x}=\bigl(m,\ \vect{r}_I,\ \vect{v}_I,\ \quat{q}_{B\to I},\ \boldsymbol{\omega}_B\bigr),
+\qquad
+\vect{u}=\vect{T}_B .
+\end{equation}
+The control is the thrust vector expressed in the body frame; its direction
+relative to $\hat{\vect{z}}_B$ is the gimbal deflection and its magnitude is the
+throttle setting.
+
+\subsection{Equations of motion}
+
+\begin{align}
+\dot m &= -\frac{\lVert\vect{u}\rVert}{I_{sp}\,g_0} \;=\; -\alpha\lVert\vect{u}\rVert,
+  &\alpha &\equiv \frac{1}{I_{sp} g_0}, \label{eq:mdot}\\
+\dot{\vect{r}} &= \vect{v}, \label{eq:rdot}\\
+\dot{\vect{v}} &= \frac{\Rot(\quat{q})\,\vect{u}}{m} + \vect{g}, \label{eq:vdot}\\
+\dot{\quat{q}} &= \tfrac{1}{2}\,\quat{q}\otimes(0,\boldsymbol{\omega}), \label{eq:qdot}\\
+\vect{J}\dot{\boldsymbol{\omega}} &= \vect{r}_T\times\vect{u}
+  - \boldsymbol{\omega}\times\vect{J}\boldsymbol{\omega}. \label{eq:wdot}
+\end{align}
+
+$\vect{J}=\mathrm{diag}(J_x,J_y,J_z)$ is constant --- the inertia is \emph{not}
+updated as propellant is consumed --- and $\vect{r}_T$ is the thrust application
+point in the body frame, nominally $(0,0,-\ell)$ with $\ell=12$~m, so
+$\vect{r}$ is the centre of mass. Since $\vect{r}_T$ is on the roll axis, a
+single gimballed engine produces no roll torque; roll is left uncontrolled
+throughout.
+
+The tilt from vertical follows from the quaternion alone,
+\begin{equation}
+\cos\theta_{\mathrm{tilt}} = 1-2\left(q_1^2+q_2^2\right).
+\label{eq:tilt}
+\end{equation}
+
+\section{Guidance}
+\label{sec:guidance}
+
+\subsection{Successive convexification with free final time}
+
+The 6-DoF problem is solved by SCvx following Szmuk and A\c{c}{\i}kme\c{s}e
+(arXiv:1802.03827). Free final time is handled by time dilation: the trajectory
+is posed on normalised time $\tau\in[0,1]$ with
+\begin{equation}
+\frac{\dd\vect{x}}{\dd\tau} = \sigma\, \vect{f}(\vect{x},\vect{u}),
+\qquad \sigma \equiv t_f ,
+\end{equation}
+so the time of flight becomes a scalar decision variable.
+
+Each iteration linearises about the current reference
+$(\bar{\vect{x}},\bar{\vect{u}},\bar\sigma)$:
+\begin{equation}
+\frac{\dd\vect{x}}{\dd\tau} \approx
+  \vect{A}(\tau)\vect{x} + \vect{B}(\tau)\vect{u} + \vect{S}(\tau)\sigma + \vect{z}(\tau),
+\end{equation}
+\begin{equation}
+\vect{A}=\bar\sigma\frac{\partial \vect{f}}{\partial \vect{x}},\quad
+\vect{B}=\bar\sigma\frac{\partial \vect{f}}{\partial \vect{u}},\quad
+\vect{S}=\vect{f}(\bar{\vect{x}},\bar{\vect{u}}),\quad
+\vect{z}=-\left(\vect{A}\bar{\vect{x}}+\vect{B}\bar{\vect{u}}\right).
+\end{equation}
+The Jacobians are analytic (\code{rocketJacobians}). Discretisation uses a
+first-order hold on $\vect{u}$ over $K$ nodes with the state-transition matrices
+integrated by RK4 (\code{rk4Substeps} sub-steps per interval), giving
+\begin{equation}
+\vect{x}_{k+1} = \bar{\vect{A}}_k\vect{x}_k
+ + \bar{\vect{B}}^-_k\vect{u}_k + \bar{\vect{B}}^+_k\vect{u}_{k+1}
+ + \bar{\vect{S}}_k\sigma + \bar{\vect{z}}_k + \boldsymbol{\nu}_k ,
+\end{equation}
+where $\boldsymbol{\nu}_k$ is virtual control, which keeps the linearised
+subproblem feasible at every iteration.
+
+\subsection{Subproblem objective}
+
+With $\hat{\cdot}$ denoting scaled variables and $s_{x_i}$ the state scale
+factors,
+\begin{equation}
+\min\;\; -\frac{m_N}{m_{\mathrm{wet}}}
+ \;+\; w_\nu\left(\sum_{k}\sum_{i}\frac{\lvert\nu_{k,i}\rvert}{s_{x_i}}
+ \;+\; \sum_{k}\sum_{s}\zeta_{k,s}\right),
+\label{eq:objective}
+\end{equation}
+maximising terminal mass, i.e.\ minimising fuel, with an $\ell_1$ penalty on the
+dynamic defect and on the state-triggered-constraint slacks $\zeta$.
+
+\subsection{Path constraints}
+
+All are imposed at every node and are second-order-cone representable.
+
+\begin{align}
+m_k &\ge m_{\mathrm{dry}} && \text{(propellant budget)} \\
+\lVert\vect{u}_k\rVert &\le T_{\max} && \text{(upper thrust bound)} \\
+\bar{\vect{n}}_k^{\mathsf{T}}\vect{u}_k &\ge T_{\min},
+  \quad \bar{\vect{n}}_k=\frac{\bar{\vect{u}}_k}{\lVert\bar{\vect{u}}_k\rVert}
+  && \text{(lower bound, linearised)} \\
+\lVert\vect{u}_k\rVert &\le \frac{u_{k,z}}{\cos\delta_{\max}}
+  && \text{(gimbal envelope)} \\
+\bigl\lVert(q_1,q_2)_k\bigr\rVert &\le \sqrt{\tfrac{1}{2}\left(1-\cos\theta_{\max}\right)}
+  && \text{(tilt, from \eqref{eq:tilt})} \\
+\lVert\boldsymbol{\omega}_k\rVert &\le \omega_{\max}
+  && \text{(body rate)} \\
+\bigl\lVert \vect{r}_{xy,k}-\vect{r}_{f,xy}\bigr\rVert
+  &\le \cot\gamma_{gs}\,\left(r_{z,k}-r_{f,z}\right)
+  && \text{(glide slope, if } \gamma_{gs}>0)
+\end{align}
+
+The lower thrust bound is the one genuinely non-convex constraint; it is
+linearised about the reference direction rather than losslessly relaxed as in
+the 3-DoF case. This is a place where the reference-dependence of the feasible
+set is worth a reviewer's attention.
+
+\subsection{State-triggered constraints}
+
+A trigger--constraint pair $\bigl(g,c\bigr)$ encodes
+``$g(\vect{x},\vect{u})<0 \Rightarrow c(\vect{x},\vect{u})\le 0$'' through the
+single continuous inequality
+\begin{equation}
+h \;=\; -\min\!\left(g,0\right)\cdot c \;\le\; 0,
+\end{equation}
+linearised in each subproblem, after Szmuk, Reynolds and A\c{c}{\i}kme\c{s}e
+(2020). Compound triggers compose $g$ by $\max$ (AND) or $\min$ (OR).
+
+The shipped instance limits angle of attack above a speed threshold. With
+$\hat{\vect{z}}_B=\Rot(\quat{q})\vect{e}_3$,
+\begin{align}
+g &= v_{\mathrm{trig}} - \lVert\vect{v}\rVert, \\
+c &= \vect{v}\cdot\hat{\vect{z}}_B + \cos\alpha_{\max}\lVert\vect{v}\rVert .
+\end{align}
+$c\le0$ is equivalent to $\angle(-\vect{v},\hat{\vect{z}}_B)\le\alpha_{\max}$,
+which is the angle of attack for a body flying nose-first.
+
+\subsection{Trust region and acceptance}
+
+The trust region is \emph{hard}, imposed as a cone constraint on the scaled
+deviation at every node,
+\begin{equation}
+\left\lVert \bigl(\hat{\vect{x}}_k-\hat{\bar{\vect{x}}}_k;\ \hat{\vect{u}}_k-\hat{\bar{\vect{u}}}_k\bigr)\right\rVert \le r,
+\qquad
+\bigl\lvert \hat\sigma-\hat{\bar\sigma}\bigr\rvert \le r .
+\end{equation}
+
+\emph{Discrepancy flagged for review:} the header comment in
+\code{include/pdg/scvx.hpp} describes ``soft quadratic trust regions''. The
+implementation in \code{src/scvx.cpp} uses the hard cone above. The document
+follows the code.
+
+Steps are accepted or rejected on the ratio of actual to predicted penalty
+reduction,
+\begin{equation}
+\rho = \frac{J(\bar{\vect{x}}) - J_{\mathrm{nl}}(\vect{x}^\star)}
+            {J(\bar{\vect{x}}) - J_{\mathrm{lin}}(\vect{x}^\star)},
+\end{equation}
+accepting when $\rho\ge\rho_0$, shrinking the radius by $c_-$ when
+$\rho<\rho_1$, growing it by $c_+$ when $\rho\ge\rho_2$, all clipped to
+$[r_{\min},r_{\max}]$ (Mao, Szmuk and A\c{c}{\i}kme\c{s}e). The nonlinear
+penalty $J_{\mathrm{nl}}$ is evaluated by single-shooting the accepted control
+through the true dynamics, so the reported defect is a genuine integration
+residual.
+
+Convergence is declared when the scaled state change, the virtual control and
+the predicted reduction all fall below their tolerances.
+
+\subsection{The 3-DoF case, for reference}
+
+A separate solver (\code{pdg::lcvx}) treats the translation-only minimum-fuel
+problem by lossless convexification after A\c{c}{\i}kme\c{s}e and Ploen (2007):
+the slack $\varsigma$ replaces $\lVert\vect{u}\rVert$ with
+$\lVert\vect{u}\rVert\le\varsigma$, $T_{\min}\le\varsigma\le T_{\max}$, and the
+relaxation is tight at the optimum. Free final time is a golden-section search
+over $t_f$. This path is not used by the pipeline documented here and is
+mentioned only for completeness.
+
+\section{Plant and closed loop}
+\label{sec:closedloop}
+
+\subsection{Integration and control sampling}
+
+The plant integrates \eqref{eq:mdot}--\eqref{eq:wdot} with fixed-step RK4. The
+controller is sampled once per step at the step start and held constant across
+it, which is a zero-order hold at $1/\Delta t$~Hz. The flight log is written from
+inside that sampling, so each logged row is a real controller tick rather than a
+re-integration.
+
+Integration stops at the first step with $r_z\le0$; touchdown quantities are
+interpolated between the bracketing states. Note that $\vect{r}$ is the centre of
+mass and the model carries no vehicle height, so ``touchdown'' is the centre of
+mass reaching ground level.
+
+\subsection{Plant dispersions}
+
+The plant is perturbed while the guidance and the autopilot are not told:
+
+\begin{description}
+\item[Thrust scale] $s_T$ multiplies the commanded vector.
+\item[Specific impulse] $I_{sp}\leftarrow s_{I}\,I_{sp}$ in the plant only.
+\item[Engine misalignment] a fixed cant $a$ about an axis in the body $x$--$y$
+  plane at azimuth $\psi$, applied by Rodrigues' formula with
+  $\hat{\vect{k}}=(-\sin\psi,\cos\psi,0)$:
+  \begin{equation}
+  \vect{R} = \vect{I}\cos a + [\hat{\vect{k}}]_\times \sin a
+           + \hat{\vect{k}}\hat{\vect{k}}^{\mathsf{T}}(1-\cos a).
+  \end{equation}
+\item[Actuator lag] a first-order lag with time constant $\tau_a$ toward the
+  mid-step target, applied exactly over the step:
+  \begin{equation}
+  \vect{u} \leftarrow \vect{u} + \left(1-e^{-\Delta t/\tau_a}\right)
+    \left(\vect{u}_{\mathrm{tgt}}-\vect{u}\right).
+  \end{equation}
+\end{description}
+
+The dispersed command is finally clamped to $\lVert\vect{u}\rVert\le T_{\max}$.
+
+\subsection{Tracking autopilot}
+
+The guidance solution is computed once; a PD autopilot flies it. This split is
+deliberate --- an SCvx solve takes of order half a second and cannot sit inside a
+control loop.
+
+Let $(\vect{x}_r,\vect{u}_{r,B})$ be the reference interpolated to the current
+time. The translation loop forms a saturated acceleration correction,
+\begin{equation}
+\vect{a}_c = \mathrm{sat}_{a_{\max}}\!\left[
+  k_{p}\left(\vect{r}_r-\vect{r}\right) + k_{d}\left(\vect{v}_r-\vect{v}\right)\right],
+\end{equation}
+and a desired inertial force
+\begin{equation}
+\vect{f}_{\mathrm{des}} = \Rot(\quat{q}_r)\vect{u}_{r,B} + m\,\vect{a}_c,
+\qquad
+\lVert\vect{f}_{\mathrm{des}}\rVert \in [T_{\min},T_{\max}].
+\end{equation}
+Past the end of the reference the feedforward becomes a hover term
+$\vect{f}_r=-m\vect{g}$.
+
+The desired attitude is the reference attitude composed with the small rotation
+carrying $\hat{\vect{f}}_r$ onto $\hat{\vect{f}}_{\mathrm{des}}$, using the
+small-angle quaternion built from the cross product:
+\begin{equation}
+\vect{a}_{\mathrm{rot}}=\hat{\vect{f}}_r\times\hat{\vect{f}}_{\mathrm{des}},
+\qquad
+\dd\quat{q}=\mathrm{normalise}\bigl(1,\tfrac{1}{2}\vect{a}_{\mathrm{rot}}\bigr),
+\qquad
+\quat{q}_{\mathrm{des}}=\dd\quat{q}\otimes\quat{q}_r .
+\end{equation}
+The body-frame attitude error is $\quat{q}_e=\quat{q}^{-1}\otimes\quat{q}_{\mathrm{des}}$,
+reduced to the two controllable components with a sign convention that takes the
+short way round,
+\begin{equation}
+e_x = 2\,\mathrm{sgn}(q_{e,0})\,q_{e,1},\qquad
+e_y = 2\,\mathrm{sgn}(q_{e,0})\,q_{e,2}.
+\end{equation}
+The PD attitude loop produces angular accelerations
+$a_x = k_{a}e_x + k_{d,a}(\omega_{r,x}-\omega_x)$ and likewise $a_y$, converted
+to a gimbal increment through the moment arm $L=\lvert r_{T,z}\rvert$:
+\begin{equation}
+u_x = u_{r,x}\frac{\lVert\vect{f}_{\mathrm{des}}\rVert}{\lVert\vect{f}_r\rVert} - \frac{J_y a_y}{L},
+\qquad
+u_y = u_{r,y}\frac{\lVert\vect{f}_{\mathrm{des}}\rVert}{\lVert\vect{f}_r\rVert} + \frac{J_x a_x}{L}.
+\end{equation}
+The lateral component is limited to half the commanded magnitude, and
+\begin{equation}
+u_z=\sqrt{\max\!\left(\lVert\vect{f}_{\mathrm{des}}\rVert^2-u_x^2-u_y^2,\;
+  \tfrac{1}{4}\lVert\vect{f}_{\mathrm{des}}\rVert^2\right)} .
+\end{equation}
+
+\emph{For review:} this lateral limit of $\tfrac{1}{2}\lVert\vect{f}\rVert$
+corresponds to a $30^\circ$ gimbal, far outside the $\delta_{\max}=12^\circ$ the
+guidance was solved against. The autopilot therefore may command deflections the
+guidance never considered feasible. It is a plant-side saturation only, but it
+means the closed-loop trajectory is not guaranteed to respect the guidance
+gimbal envelope.
+
+\subsection{Feasibility bound reported before solving}
+
+The bridge prints an energy screen so an impossible case is recognisable before
+the solver is blamed. With no atmosphere, the entire deceleration must come from
+the engine:
+\begin{equation}
+\Delta v_{\mathrm{avail}} = I_{sp} g_0 \ln\frac{m_{\mathrm{wet}}}{m_{\mathrm{dry}}},
+\qquad
+v_{\mathrm{arr}} = \sqrt{\lVert\vect{v}_0\rVert^2 + 2 g_0 h_0},
+\qquad
+\frac{T}{W} = \frac{T_{\max}}{m_{\mathrm{wet}} g_0}.
+\end{equation}
+$v_{\mathrm{arr}}$ is the speed an unpowered vehicle would reach at the ground
+and is a strict lower bound on the required $\Delta v$; gravity losses during the
+burn add to it. The case is reported as unachievable when
+$v_{\mathrm{arr}}>\Delta v_{\mathrm{avail}}$.
+
+\section{Donor reconstruction layer}
+\label{sec:donor}
+
+This section is the part of the model written for this project, and it carries
+the most modelling risk. The donor core emits a text trajectory log at one line
+per $250$ integration steps, i.e.\ $2$~Hz, carrying
+\begin{equation}
+\left\{t,\ h,\ v_z,\ \text{throttle},\ \lvert\theta_{\mathrm{tilt}}\rvert,\
+ \ell,\ v_{\mathrm{rad}},\ \bar q,\ \omega_\perp,\ w,\ m,\ \text{phase}\right\},
+\end{equation}
+where $h$ is the height of the vehicle base, $\ell=\sqrt{r_x^2+r_y^2}$ is the
+horizontal \emph{distance} from the pad, $v_{\mathrm{rad}}$ its rate, $\bar q$
+dynamic pressure, and $\omega_\perp$ the magnitude of the perpendicular body
+rate. Three quantities the viewer needs are absent and must be reconstructed.
+
+\subsection{Thrust from mass flow}
+
+The logged throttle fraction does not say how many engines are lit --- three for
+the entry burn, one to land --- so thrust is taken from the mass flow instead:
+\begin{equation}
+T = \max\!\left(-\frac{\dd m}{\dd t},\,0\right) g_0\, I_{sp}(h),
+\qquad
+I_{sp}(h) = I_{sp}^{\mathrm{vac}}
+ + \left(I_{sp}^{\mathrm{sl}}-I_{sp}^{\mathrm{vac}}\right) e^{-h/H},
+\end{equation}
+with scale height $H=8500$~m, and $T$ forced to zero wherever the logged
+throttle is zero. The exponential is a crude stand-in for the ambient pressure
+ratio; it affects only the $282$ to $311$~s blend, a $10\%$ effect on magnitude.
+
+\subsection{Signing the range}
+
+$\ell$ is a distance and cannot be negative, so a stage passing over the pad and
+out the other side appears to reflect off $\ell=0$. The sign is recovered by
+detecting the cusp this leaves. Between consecutive samples a crossing is
+declared when all three hold:
+\begin{equation}
+v_{\mathrm{rad},i-1}\,v_{\mathrm{rad},i} < 0,
+\qquad
+\min\bigl(\lvert v_{\mathrm{rad},i-1}\rvert,\lvert v_{\mathrm{rad},i}\rvert\bigr) > v_\epsilon,
+\qquad
+\min\bigl(\ell_{i-1},\ell_i\bigr) < \max_i\lvert v_{\mathrm{rad}}\rvert\,\Delta t ,
+\end{equation}
+with $v_\epsilon=0.5$~m/s, after which the sign is inverted for all subsequent
+samples. A genuine radial turnaround away from the pad has $v_{\mathrm{rad}}$
+decaying smoothly through zero and fails the last two tests.
+
+The unfolding is applied \emph{before} resampling, because the signed coordinate
+passes smoothly through zero and is therefore safe to interpolate linearly,
+while the folded one has a corner there.
+
+This assumes the horizontal motion stays in one vertical plane. The log carries
+no azimuth, so the assumption cannot be checked from the data.
+
+\subsection{Lean direction}
+
+The log carries the tilt magnitude but never which side it leans. Thrust acts
+along the body axis, so a stage accelerating toward $+x$ is leaning that way:
+\begin{equation}
+\mathrm{sign}(\theta) = \mathrm{sign}\!\left(\overline{\dot v_{\mathrm{rad}}}\right)
+\quad\text{while } T>0.05\,T_{\max},
+\end{equation}
+with the acceleration smoothed by a 5-sample boxcar and the last decision held
+while the engine is off. The commanded lean angle is then
+\begin{equation}
+\theta_{\mathrm{cmd}} = \lvert\theta_{\mathrm{tilt}}\rvert \cdot \mathrm{sign}(\theta).
+\end{equation}
+
+\subsection{Attitude dynamics of the reconstruction}
+
+$\theta_{\mathrm{cmd}}$ is a step function wherever the inferred sign changes,
+and a stage cannot step. Drawing it directly produced $347^\circ$/s slews,
+roughly twelve times anything the vehicle achieves. The command is therefore
+flown through the control authority the vehicle actually has.
+
+\subsubsection{Pitch inertia}
+
+Following the donor's own \code{mass\_props}: the dry stage as a thin-walled
+shell and the propellant as a solid column, both carried to the combined centre
+of mass by the parallel-axis theorem. With propellant mass
+$m_p=\max(m-m_{\mathrm{dry}},0)$, column cross-section $A$, mixture density
+$\rho$, column radius $r_c^2=A/\pi$:
+\begin{gather}
+h_c = \frac{m_p}{\rho A},\qquad
+z_c = z_{\mathrm{base}} + \tfrac{1}{2}h_c,\qquad
+z_{\mathrm{com}} = \frac{m_{\mathrm{dry}}z_{\mathrm{dry}} + m_p z_c}{m},\\[2pt]
+I_{\mathrm{dry}} = \frac{m_{\mathrm{dry}}\left(6R^2+L^2\right)}{12},
+\qquad
+I_{c} = \frac{m_p\left(3r_c^2+h_c^2\right)}{12},\\[2pt]
+I_{\mathrm{pitch}} = I_{\mathrm{dry}} + m_{\mathrm{dry}}\left(z_{\mathrm{dry}}-z_{\mathrm{com}}\right)^2
+ + I_{c} + m_p\left(z_c-z_{\mathrm{com}}\right)^2 .
+\end{gather}
+The log does not split LOX from RP-1, so a single column at the mixture density
+for the nominal $O/F$ is used. Computed range over the \code{entry} profile:
+$I_{\mathrm{pitch}}=5.1$ to $6.1\times10^6\ \mathrm{kg\,m^2}$, with
+$z_{\mathrm{com}}$ moving from $11.6$ down to $7.4$~m as the tanks empty.
+
+\subsubsection{Control authority}
+
+Three torque sources, each dominant in a different phase:
+\begin{align}
+M_{\mathrm{gimbal}} &= T \sin\delta_{\max}\; z_{\mathrm{com}}, \\
+M_{\mathrm{fin}} &= n_f\, \bar q\, S_f\, C_{N\alpha}\, \delta_f\,
+  \left(z_f - z_{\mathrm{com}}\right), \\
+M_{\mathrm{rcs}} &= n_r\, F_r \left(z_r - z_{\mathrm{com}}\right),
+\end{align}
+and the peak angular acceleration available is
+\begin{equation}
+\alpha_{\max} = \frac{M_{\mathrm{gimbal}}+M_{\mathrm{fin}}+M_{\mathrm{rcs}}}{I_{\mathrm{pitch}}} .
+\label{eq:alphamax}
+\end{equation}
+Over the \code{entry} profile the peaks are $25.4$, $99.2$ and
+$0.32\ \mathrm{deg/s^2}$ respectively: the fins fly the unpowered aero descent,
+the gimbal the burns, and the RCS is all that remains in near-vacuum.
+
+A slew of $\theta$ flown bang-bang --- accelerate half way, decelerate the rest
+--- then takes
+\begin{equation}
+t_{\mathrm{slew}} = 2\sqrt{\frac{\theta}{\alpha_{\max}}},
+\qquad
+\omega_{\mathrm{peak}} = \sqrt{\theta\,\alpha_{\max}} .
+\label{eq:slewtime}
+\end{equation}
+
+\subsubsection{Slew limiter}
+
+The command is tracked by a time-optimal double integrator. At each step the
+target rate is the fastest that can still be brought to rest exactly on target,
+\begin{equation}
+\omega_{\mathrm{des}} = \mathrm{sgn}(e)\sqrt{2\alpha_{\max}\lvert e\rvert},
+\qquad e = \theta_{\mathrm{cmd}} - \theta,
+\end{equation}
+clipped to the logged rate bound, with the rate change limited by the available
+acceleration:
+\begin{equation}
+\omega \leftarrow \mathrm{clip}\Bigl(
+  \omega + \mathrm{clip}\bigl(\omega_{\mathrm{des}}-\omega,\ \pm\alpha_{\max}\Delta t\bigr),
+  \ \pm\omega_\perp\Bigr),
+\qquad
+\theta \leftarrow \theta + \omega\,\Delta t .
+\end{equation}
+
+The cap at the logged $\omega_\perp$ is not a modelling choice: the in-plane
+component of an angular rate cannot exceed the magnitude of that rate, so it is
+an exact bound, and it keeps the reconstruction honest wherever
+\eqref{eq:alphamax} is generous.
+
+\paragraph{Validation.} The reconstructed peak rate sits just below the rate the
+donor itself recorded, across every scenario:
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+scenario & reconstructed & logged $\omega_\perp$ \\
+\midrule
+\code{entry}       & $20.2^\circ$/s & $28.6^\circ$/s \\
+\code{terminal}    & $8.4^\circ$/s  & $9.7^\circ$/s  \\
+\code{aero\_offset}& $11.0^\circ$/s & $12.6^\circ$/s \\
+\code{chaos}       & $11.9^\circ$/s & $12.0^\circ$/s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Synthesised attitude}
+
+The reconstruction is a pure pitch about the inertial $y$ axis by $\theta$,
+which takes $\hat{\vect{z}}_B$ toward $+x$:
+\begin{equation}
+\quat{q} = \left(\cos\tfrac{\theta}{2},\,0,\,\sin\tfrac{\theta}{2},\,0\right),
+\qquad
+\boldsymbol{\omega} = \left(0,\ \dot\theta,\ 0\right).
+\end{equation}
+The gimbal is written as zero, $\vect{u}=(0,0,T)$, because the log omits it.
+Consequently the gimbal trace is identically zero for donor runs and the drawn
+thrust is always along the body axis.
+
+\subsection{Resampling}
+
+The $2$~Hz log is interpolated linearly onto a uniform $20$~Hz grid for playback
+only; the phase label is held rather than blended. This adds no information and
+both rates are recorded in the metadata. All reconstruction above is performed on
+the interpolated grid except the range unfolding, which precedes it.
+
+\section{RTLS trajectory model}
+\label{sec:rtls}
+
+This section covers \code{bridge/rtls\_trajectory.py}, which flies the solo
+first-stage return-to-launch-site profile from liftoff to the entry interface at
+$h_{\mathrm{EI}}=65$~km on the way down. Below that the donor core takes the
+flight, so Section~\ref{sec:donor} applies from there. The two are never mixed:
+the handover is a state vector and nothing else. Why $65$ and not the $70$~km the
+specification names is a property of the donor's guidance rather than of the
+physics, and is set out in Section~\ref{subsec:handover}.
+
+\subsection{Why the split is at 70\,km}
+
+The boostback burn and the coast are a vacuum problem. Against US76 at
+$1579\ \mathrm{m/s}$ the dynamic pressure is $386$~Pa at $60$~km, $23$~Pa at
+$80$~km and $0.70$~Pa at $100$~km. On an $80$~t stage with the engines-first
+$C_D S$ of Section~\ref{subsec:cds} the last of these is a deceleration of
+$8\times10^{-5}\ \mathrm{m/s^2}$, four parts in $10^{5}$ of the thrust
+acceleration. Thrust-and-gravity dynamics are therefore valid across the
+boostback and the coast, and the atmosphere only has to be right on the way back
+down --- which is exactly the donor's competence.
+
+\subsection{Frame and equations of motion}
+
+Planar, Earth-centred and \emph{non-rotating}, with the pad at
+$(0,R_\oplus)$, $R_\oplus=6371$~km. The state is
+$\vect{y}=(X,Z,V_X,V_Z,m)$ and gravity is central rather than flat, with $\mu$
+pinned so that surface gravity is exactly $g_0$:
+\begin{equation}
+\mu = g_0 R_\oplus^2,
+\qquad
+\vect{a}_g = -\frac{\mu}{\lVert\vect{r}\rVert^3}\,\vect{r} .
+\end{equation}
+Altitude, ground-track range and the local frame are
+\begin{equation}
+h = \lVert\vect{r}\rVert - R_\oplus,
+\qquad
+d = R_\oplus \arctan\!\frac{X}{Z},
+\qquad
+\hat{\vect{u}} = \frac{\vect{r}}{\lVert\vect{r}\rVert},
+\qquad
+\hat{\vect{e}} = \frac{(Z,-X)}{\lVert\vect{r}\rVert} ,
+\end{equation}
+so that $\hat{\vect{u}}$ is local up and $\hat{\vect{e}}$ points downrange.
+Curvature matters here: over $70$~km of ground track the surface falls $384$~m,
+which is negligible against $130$~km of altitude but not against a landing.
+
+The equations of motion are
+\begin{equation}
+\dot{\vect{v}} = \vect{a}_g
+  + \frac{n_e\,\tau\,T_e(p)}{m}\,\hat{\vect{u}}_T
+  - \frac{q S C_D(M)}{m}\,\frac{\vect{v}}{\lVert\vect{v}\rVert},
+\qquad
+\dot m = -n_e\,\tau\,\dot m_e ,
+\end{equation}
+with $q=\tfrac12\rho\lVert\vect{v}\rVert^2$, $M=\lVert\vect{v}\rVert/a$, and the
+pressure-corrected engine thrust taken in the donor's own form
+$T_e(p)=T_{\mathrm{vac}}-A_e p$. Integration is fixed-step RK4; a stop condition
+(cutoff speed, altitude crossing, burn duration) is refined onto the condition by
+bisection of the final step, so a cutoff lands on the condition rather than on
+the step after it.
+
+\subsection{Atmosphere}
+
+US76 in two regimes. Below $86$~km geometric the seven-layer lapse-rate stack,
+evaluated at geopotential altitude $H = R' h/(R'+h)$ with $R'=6356.766$~km:
+\begin{equation}
+T = T_b + L_b (H - H_b),
+\qquad
+p = \begin{cases}
+p_b\left(\dfrac{T_b}{T}\right)^{g_0/(R_{\mathrm{air}}L_b)}, & L_b \neq 0,\\[2ex]
+p_b\exp\!\left(-\dfrac{g_0 (H-H_b)}{R_{\mathrm{air}}T_b}\right), & L_b = 0,
+\end{cases}
+\qquad \rho = \frac{p}{R_{\mathrm{air}}T}.
+\end{equation}
+Above $86$~km the model stops being a lapse-rate one --- molecular weight varies
+and the temperature profile is tabulated --- so density is log-interpolated from
+the published table instead of extrapolated. That distinction is not cosmetic: an
+exponential tail overstates the density at $100$~km by about $20\,\%$, and it is
+precisely the near-zero that the vacuum argument above rests on.
+
+The implementation reproduces the published density to better than $0.01\,\%$
+from sea level to $120$~km (\code{rtls\_trajectory.self\_test}). Note that
+$84.852$~km geopotential \emph{is} $86$~km geometric, so the two regimes meet
+exactly and quoting a US76 table against the wrong one of the two shows up as a
+spurious $17\,\%$ model error.
+
+\subsection{Drag coefficient, nose-first and engines-first}
+\label{subsec:cds}
+
+The reference notebook uses $C_D=0.5$ on $4\pi=12.57\ \mathrm{m^2}$; the expert
+review of this model suggested $C_D\approx1.0$. The two differ by $1.7\times$ in
+$C_D S$ and the discrepancy is not a disagreement about the same number: they
+describe \textbf{different attitudes}.
+
+\begin{description}
+\item[Ascent, nose-first.] Flying solo the stage carries a nose fairing over the
+  open interstage, a $6.0$~m cone of $17^\circ$ half-angle on the $3.66$~m body.
+  A pointed cone-cylinder at zero incidence has $C_D\approx0.30$ subsonic, a
+  transonic peak of $0.55$ just past $M=1$, decaying to $0.24$ by $M=8$.
+  Referenced to $S=\pi(D/2)^2=10.52\ \mathrm{m^2}$, that is a peak
+  $C_D S = 5.79\ \mathrm{m^2}$.
+\item[Return, engines-first.] A returning booster flies engines-first, so the
+  leading end is a flat, separated base --- a bluff body, not a cone. The donor
+  already carries this as a Mach table, $C_A = 0.85\ldots1.40$ on the same
+  $10.52\ \mathrm{m^2}$, i.e.\ $C_D S = 8.94\ldots14.73\ \mathrm{m^2}$.
+\end{description}
+
+So the review is right about the return and the notebook's figure is closer to
+the ascent value, and since the donor owns every metre below the entry interface,
+the coefficient that matters for the descent is settled by the code that flies
+it. This module uses the cone table for the ascent and the donor's own table for
+the short stretch of its coast that is still in measurable air, so the two halves
+of the flight do not disagree across the handover.
+
+One consequence worth recording: the task's own \emph{Architecture} table quotes
+the drag on an $80$~t stage at $60$~km as $0.025\ \mathrm{m/s^2}$, which is
+$C_D S \approx 5.2\ \mathrm{m^2}$ --- the notebook's ascent-like value applied to
+a vehicle flying backwards. With the donor's coefficient it is
+$0.047\ \mathrm{m/s^2}$. Both are negligible against thrust, so the conclusion
+stands, but the figure is low by $1.9\times$.
+
+\subsection{Ascent}
+
+The nose fairing changes the ascent drag and nothing else. The pitch programme is
+vertical rise, a smoothstepped kick, then a zero-angle-of-attack gravity turn,
+with a constant steering bias $\beta$ permitted only above $h_{\mathrm{free}}=40$~km
+where $q<300$~Pa and steering is aerodynamically free:
+\begin{equation}
+\hat{\vect{u}}_T(t) =
+\begin{cases}
+\hat{\vect{u}}, & t<t_p,\\[1ex]
+\cos(\psi\tilde s)\,\hat{\vect{u}} + \sin(\psi\tilde s)\,\hat{\vect{e}},
+  \quad \tilde s = s^2(3-2s),\ s=\dfrac{t-t_p}{t_r}, & t_p \le t < t_p+t_r,\\[2ex]
+\hat{\vect{v}}, & h<h_{\mathrm{free}},\\[1ex]
+\cos\beta\,\hat{\vect{v}} + \sin\beta\,\hat{\vect{n}}, & h\ge h_{\mathrm{free}},
+\end{cases}
+\end{equation}
+with $\hat{\vect{n}}\perp\hat{\vect{v}}$ on the downrange side. Throttle holds an
+axial acceleration cap:
+\begin{equation}
+\tau = \min\!\left(1,\ \max\!\left(\tau_{\min},\ \frac{a_{\mathrm{cap}} g_0 m}{n_e T_e(p)}\right)\right).
+\end{equation}
+
+\paragraph{Why the cap is a free variable.} This is the whole difficulty of a
+solo ascent. Without a $107.5$~t upper stack the stage is light, and flown at
+full thrust it reaches $1579\ \mathrm{m/s}$ while still only $54$~km up ---
+$6.5$~km short of the cutoff condition, with $\beta$ already saturated against
+its bound and nowhere left to go. CRS-9 reached the same speed at $60.4$~km
+because it was dragging the upper stack; a solo stage accelerates too well to
+arrive that high that slowly. The stage therefore has to be held back to fly a
+trajectory it could not otherwise reach, so $a_{\mathrm{cap}}$ is solved for
+rather than fixed, and the value it settles on --- $2.79$~g --- is a result. The
+burn is not much longer for it ($109.9$~s against $110.6$); it is a different
+shape, climbing more steeply for the same speed.
+
+\paragraph{The solve.} Four unknowns
+$(m_0,\ t_p,\ \psi,\ \beta,\ a_{\mathrm{cap}})$ --- five, counting the cap ---
+against three conditions evaluated at the instant $\lVert\vect{v}\rVert$ reaches
+the cutoff speed: altitude, ground-track range, and the mass remaining. The mass
+condition is supplied by the caller and is what makes the return budget close.
+A fourth residual takes up the remaining freedom: either a small penalty on
+$\beta$, so the solve prefers the least-steering trajectory, or a target flight
+path angle when one is asked for. Solved by \code{scipy} trust-region least
+squares on a coarse step, then re-flown at the fine step.
+
+\paragraph{The flight path angle is not pinned by the cutoff spec.} Altitude,
+speed and downrange are three numbers; the direction of the velocity is a fourth
+and they do not determine it. It matters, because apogee follows from the
+vertical component almost alone. Sweeping it shows the trade: the least-steering
+solution cuts off at $\gamma\approx50^\circ$, costs $151$~t of propellant in
+total and reaches $168$~km; forcing $\gamma$ down towards the $30$--$40^\circ$
+the task assumes costs $171$~t and reaches $153$~km, and below about $42^\circ$
+the steering bias saturates and the trajectory is not reachable at all under a
+zero-incidence gravity turn through the atmosphere. CRS-9's measured $128.7$~km
+apogee would need $\gamma\approx32^\circ$, which this ascent cannot produce while
+also arriving at $60.4$~km only $35$~km downrange.
+
+\subsection{Turnaround and boostback}
+
+\paragraph{The turnaround is flown by the engines, not by the cold gas.} Out of
+the atmosphere the grid fins produce no torque and, with the engines off, neither
+does the gimbal, so the obvious model gives the whole flip to the RCS. Two
+$500$~N nozzles at the $40.5$~m station against $J\approx6.2\times10^6\
+\mathrm{kg\,m^2}$ give $\alpha_{\mathrm{RCS}}=0.31\ \mathrm{deg/s^2}$, and a
+bang-bang slew of $150^\circ$ then takes $44$~s --- during which the stage
+travels a further $49$~km downrange, putting maximum downrange at $97$~km. It is
+also slower than the real vehicle, whose MECO-to-boostback gap on CRS-9 was
+$37$~s \emph{including} stage separation.
+
+What actually happens is that the stage settles its propellant for
+$t_s=8$~s, relights, and lets the gimbal finish the turn:
+\begin{equation}
+\alpha_{\mathrm{lit}}
+ = \frac{n_r F_r\lvert z_r - z_{\mathrm{com}}\rvert + T\sin\delta_{\max}\,z_{\mathrm{com}}}{J}
+ \approx 15.7\ \mathrm{deg/s^2},
+\end{equation}
+fifty times the cold gas, so the same $150^\circ$ takes $5.7$~s. The burn and the
+turn are one manoeuvre, so the thrust direction slews \emph{during} the burn,
+bang-bang within $\alpha_{\mathrm{lit}}$, and the solver integrates the fact that
+the thrust genuinely points the wrong way for the first few seconds rather than
+assuming it away. This one modelling choice moves maximum downrange from $97$~km
+to $61$~km, i.e.\ from outside the $59$--$70$~km band to inside it.
+
+\paragraph{The boostback as a boundary-value problem.} This is a targeting
+problem, not a landing problem, which is why the SCvx formulation of
+Section~\ref{sec:guidance} does not apply: its terminal condition is ``at the
+origin with near-zero velocity'' and the stage at boostback cutoff is $100$~km up
+and moving at a kilometre a second. What is solved is the return leg of the
+reference notebook's phase~2, posed on the cutoff state:
+
+\begin{quote}
+given the state at engine cutoff, find a burn --- attitude $\chi$ held fixed in
+the inertial frame, duration $t_b$ --- whose ballistic continuation reaches the
+launch site.
+\end{quote}
+
+That is one equality constraint against two unknowns, so there is a
+one-parameter family of solutions and the spare freedom buys the cheapest of
+them:
+\begin{equation}
+\min_{\chi}\ t_b(\chi)
+\quad\text{subject to}\quad
+d_{\mathrm{impact}}\big(\chi, t_b\big) = d_{\mathrm{aim}} ,
+\end{equation}
+which at fixed engine count and throttle is minimum propellant. For each $\chi$
+the duration is found by bisection --- the miss is monotone in $t_b$, since a
+longer burn always leaves the stage further up-range --- and $\chi$ is then
+optimised by bounded scalar minimisation. Apogee is left alone by this, so it
+remains an independent check rather than something the solve was told to hit.
+
+\paragraph{The objective is degenerate, and needs one constraint.} Scanning
+$\chi$ at a fixed cutoff state, the propellant varies by $2\,\%$ ---
+$32.64$~t at $172.5^\circ$ against $33.29$~t at $185^\circ$ --- while apogee
+moves from $163$~km to $132$~km and the vertical velocity at the entry interface
+from $-1329$ to $-1090\ \mathrm{m/s}$. A minimum-fuel objective cannot
+discriminate between those, and left unconstrained it drifts below $180^\circ$
+into thrusting \emph{upward}, lofting the stage past $200$~km to save thirty
+kilograms and handing the donor a stage arriving $500\ \mathrm{m/s}$ faster. The
+objective cannot see that cost because it stops at boostback cutoff, while the
+bill arrives later in the entry burn.
+
+The attitude is therefore constrained to $\chi\ge180^\circ$: the boostback
+thrust may not have an upward component. This is a statement about what a
+boostback \emph{is} --- a retrograde manoeuvre --- rather than a tuning choice,
+it costs $0.1\,\%$ of the propellant, and apogee still falls out of the solve
+rather than being targeted.
+
+\paragraph{The bracket is the propellant, not a round number.} The burn-time
+bracket must end just short of a dry tank. A fixed upper bound of $90$~s asks
+three Merlins for $82$~t from a stage carrying $61$, so the search integrates
+negative propellant mass, where $T/m$ diverges through zero. The resulting
+trajectories are meaningless rather than merely inaccurate, and a meaningless
+trajectory can still bracket a root: with the round bound, four attitudes in the
+middle of the useful range reported themselves unreachable. The equations of
+motion additionally refuse to thrust a stage at or below $m_{\mathrm{dry}}$.
+
+\subsection{Handover and the aim-point loop}
+\label{subsec:handover}
+
+The arc is targeted on its \emph{vacuum} impact point, which is the honest
+calculation above the interface but is not where the stage lands: the real descent has
+an atmosphere and the arc falls short. Rather than model the donor's drag a
+second time, the aim point is corrected against the donor itself --- fly it,
+measure the touchdown miss $\epsilon$, set $d_{\mathrm{aim}} \leftarrow
+d_{\mathrm{aim}} - 0.9\,\epsilon$, fly it again. The relationship is very nearly
+one-to-one, so two or three passes suffice. This is a shooting method with the
+donor as the plant.
+
+The handover itself is a state vector through the \code{custom} scenario added to
+the donor (Section~\ref{sec:donorpatch}): altitude, ground-track range, both
+velocity components, propellant remaining, and an attitude built along
+$-\hat{\vect{v}}$ rather than near-vertical, because a stage arriving from a
+boostback is flying engines-first at some $9^\circ$ off vertical, well outside
+the $\pm2^\circ$ every shipped scenario assumes.
+
+\paragraph{Why the interface sits at 65\,km.} The donor's entry burn is armed
+and cut on a \emph{predicted peak dynamic pressure}, and at $70$~km, where
+$q=62$~Pa, that prediction falls below the cut threshold while about $20$~t is
+still aboard. The burn stops early, which leaves a $55$~t stage for a landing
+burn flown on one engine. That nets
+\begin{equation}
+a_{\mathrm{net}} = \frac{T_{\mathrm{SL}}}{m} - g_0
+ = \frac{845}{55.6} - 9.81 = 5.4\ \mathrm{m/s^2},
+\qquad
+\frac{v^2}{2a_{\mathrm{net}}} = \frac{380^2}{10.8} = 13.4\ \mathrm{km},
+\end{equation}
+and $13$~km is exactly where the landing burn then ignites; it runs the tank dry
+on the way down. Sweeping the handover propellant at that interface, every load
+from $26$ to $36$~t crashes, and more propellant is monotonically worse.
+
+Below $66$~km the entry burn runs instead to its $7$~t fuel floor, leaving a
+$33$~t stage whose one-engine burn needs only $2.7$~km --- the regime the donor
+was built and tested in --- and every interface altitude from $66$~km down lands
+at $2.6$ to $4.3\ \mathrm{m/s}$. The interface is therefore placed at $65$~km,
+clear of the cliff between $68$ and $66$.
+
+This costs nothing in validity. The vacuum argument of the specification is made
+at $70$~km, but it is an argument about dynamic pressure rather than about a
+particular altitude: at $65$~km, $q\approx130$~Pa and the drag deceleration on
+the returning stage is $0.03\ \mathrm{m/s^2}$, a few hundredths of a percent of
+the entry burn's thrust acceleration and two orders of magnitude below where the
+approximation begins to matter.
+
+\subsection{The one donor patch}
+\label{sec:donorpatch}
+
+Every shipped scenario starts with essentially zero horizontal velocity:
+\code{scenario\_init} gives $V_X$ and $V_Y$ a $\pm5\ \mathrm{m/s}$ dispersion and
+nothing else, so a stage still flying back towards the pad at a couple of hundred
+metres a second could not be expressed at all. The patch adds a
+\code{vx0} field to \code{ScenDef}, a \code{custom} scenario whose initial
+conditions come from the command line, and a retrograde initial attitude. Every
+shipped scenario leaves \code{vx0} at zero and is bit-identical as a result;
+\code{--selftest} passes and the \code{entry} scenario reproduces its documented
+touchdown exactly ($3.19\ \mathrm{m/s}$, $24.07$~m).
+
+\section{Projection for display}
+\label{sec:projection}
+
+\subsection{Vertical plane}
+
+The downrange axis is the horizontal direction of the initial position, and the
+cross-range axis completes the frame:
+\begin{equation}
+\eh = \frac{\vect{r}_{0,xy}}{\lVert\vect{r}_{0,xy}\rVert},
+\qquad
+\ec = \hat{\vect{z}}\times\eh .
+\end{equation}
+Positions and velocities project as $d=\vect{r}\cdot\eh$,
+$c=\vect{r}\cdot\ec$, with altitude $r_z$ taken directly. The body and thrust
+directions project the same way after rotation into the inertial frame:
+\begin{equation}
+\hat{\vect{b}}_I = \Rot(\quat{q})\vect{e}_3,
+\qquad
+\hat{\vect{b}}_{\text{2D}} = \left(\hat{\vect{b}}_I\cdot\eh,\ \hat b_{I,z}\right).
+\end{equation}
+
+\subsection{Derived angles}
+
+\begin{align}
+\theta_{\mathrm{tilt}} &= \arccos\bigl(\mathrm{clip}(1-2(q_1^2+q_2^2),-1,1)\bigr), \\
+\delta_{\mathrm{gimbal}} &= \operatorname{atan2}\!\left(\lVert(u_x,u_y)\rVert,\ \max(u_z,\epsilon)\right), \\
+\alpha_{\mathrm{AoA}} &= \arccos\!\left(\mathrm{clip}\!\left(
+  \frac{-\vect{v}}{\lVert\vect{v}\rVert}\cdot\hat{\vect{b}}_I,-1,1\right)\right),
+  \quad \text{undefined for } \lVert\vect{v}\rVert<1\ \mathrm{m/s}.
+\end{align}
+
+\subsection{Drawing convention}
+
+The hull is drawn with its nozzle on the logged point rather than its centre of
+mass on it. For \code{pdg} data this is a deliberate offset of the engine arm
+$\ell$, because that model's state is the centre of mass and its touchdown
+condition is the centre of mass reaching $z=0$; drawing the hull around it would
+bury the vehicle in the deck. For donor data the logged height is already the
+vehicle base, so the same rule is exact. Every plotted number remains the raw
+logged value.
+
+\subsection{Camera}
+
+Included for completeness; it affects presentation only. The view is a square
+window at unit aspect throughout. On a flight that \emph{reaches} above
+$h_{\mathrm{zoom}}$ the camera holds the whole trajectory, then transitions to a
+chase window of width $w_c$ over a fixed wall-clock interval during which the
+replay is held. The trigger runs on a running minimum of altitude taken from the
+last sample above $h_{\mathrm{zoom}}$, not from the first sample of the flight:
+every profile before the RTLS one began at its highest point and came down, so
+testing the first sample was the same thing as testing the highest, and a
+running minimum from $t=0$ was the same thing as one from apogee. A flight that
+lifts off from the pad breaks both --- it starts at zero altitude, which switched
+the camera off, and latched a zero into the running minimum before the stage had
+left the ground.
+The transition interpolates geometrically in scale and smoothly in time:
+\begin{equation}
+\tilde s = s^2(3-2s),
+\qquad
+w(s) = W\left(\frac{w_c}{W}\right)^{\tilde s},
+\qquad
+\vect{p}(s) = (1-\tilde s)\,\vect{p}_{\mathrm{scene}} + \tilde s\,\vect{p}_{\mathrm{booster}} .
+\end{equation}
+The scale bar takes the largest value of the form $\{1,2,5\}\times10^n$ not
+exceeding $w/4$.
+
+\section{Assumptions and open questions}
+\label{sec:limits}
+
+Ordered roughly by how much they could matter.
+
+\begin{enumerate}
+\item \textbf{Constant inertia in the pdg plant.} $\vect{J}$ in
+  \eqref{eq:wdot} is fixed while the vehicle burns a third of its mass. The
+  donor reconstruction computes a mass-varying inertia; the C\texttt{++} plant
+  does not. The attitude response therefore stiffens less than it should late in
+  the burn.
+
+\item \textbf{In-plane assumption for donor data.} Both the range unfolding and
+  the lean reconstruction assume all horizontal motion lies in one vertical
+  plane. The log carries no azimuth, so this cannot be verified. Any real
+  azimuth change appears as an in-plane reversal, which the slew limiter then
+  renders as a physically-paced pitch-over that did not necessarily occur.
+
+\item \textbf{Lean sign from lateral acceleration.} The inference ignores
+  aerodynamic side force, which during the aero descent is not small. The sign is
+  held through unpowered stretches, so a genuine reversal there is missed until
+  the next burn.
+
+\item \textbf{Autopilot gimbal saturation exceeds the guidance envelope.} The
+  lateral clamp at $\tfrac{1}{2}\lVert\vect{f}\rVert$ permits $30^\circ$ against
+  a guidance constraint of $12^\circ$.
+
+\item \textbf{Linearised lower thrust bound.} Unlike the 3-DoF lossless
+  relaxation, the 6-DoF minimum-thrust constraint is linearised about the
+  reference, so the feasible set depends on the iterate.
+
+\item \textbf{Grid-fin authority is an upper bound.} Equation
+  \eqref{eq:alphamax} uses maximum deflection at the instantaneous dynamic
+  pressure with a constant $C_{N\alpha}$, no stall, no Mach dependence and no
+  blanketing. It is generous; the $\omega_\perp$ cap is what actually binds.
+
+\item \textbf{Isp pressure blend.} An isothermal exponential rather than the
+  US76 pressure profile the donor itself integrates.
+
+\item \textbf{No contact model in pdg.} Touchdown is a terminal condition, not a
+  landing: legs, crush and tip-over exist only in the donor.
+
+\item \textbf{Roll is uncontrolled and unmodelled in the projection.} A single
+  gimballed engine has no roll authority in the pdg model, and the 2-D
+  projection discards roll entirely.
+
+\item \textbf{No Earth rotation and no cross-range in the RTLS model.} A due-east
+  launch from $28.5^\circ$ starts with $408\ \mathrm{m/s}$ of eastward ground
+  speed and picks up a Coriolis cross-range. Section~\ref{sec:rtls} is planar and
+  non-rotating; so is the donor's frame, so adding it would have to stop at the
+  handover anyway. It biases the boostback $\Delta v$ and the ground track, and
+  the aim-point loop absorbs the residual rather than accounting for it.
+
+\item \textbf{The RTLS ascent has no attitude dynamics.} Section~\ref{sec:rtls}
+  commands a thrust direction and the vehicle takes it. The slew during the
+  boostback is rate-limited by the real gimbal authority, and the coast turn by
+  the real RCS authority, but neither is a closed attitude loop with an actuator
+  model, and there is no check that the commanded pitch rate is trackable
+  through the ascent's own dynamic pressure.
+
+\item \textbf{The return is wind-limited and the nominal flight is flown in
+  light wind.} Under the donor \code{entry} scenario's $8\ \mathrm{m/s}$ surface
+  wind and severe Dryden turbulence, the same trajectory lands at
+  $2.8\ \mathrm{m/s}$ or crashes at $27.6\ \mathrm{m/s}$ depending only on the
+  handover propellant load. This is the architectural fragility of a stage that
+  cannot hover --- one chance at the ignition point --- and it is not fixed by
+  anything in this model. The nominal RTLS flight is therefore flown at
+  $3\ \mathrm{m/s}$ and moderate turbulence, and the metadata records it.
+\end{enumerate}
+
+\section{Parameters}
+
+\subsection{pdg vehicle, default case}
+
+\begin{center}
+\begin{tabular}{llr}
+\toprule
+symbol & meaning & value \\
+\midrule
+$m_{\mathrm{wet}}$ & wet mass & $15\,000$ kg \\
+$m_{\mathrm{dry}}$ & dry mass & $10\,000$ kg \\
+$I_{sp}$ & specific impulse & $300$ s \\
+$T_{\min}$, $T_{\max}$ & thrust bounds & $80$, $250$ kN \\
+$\vect{J}$ & inertia (constant) & $(8, 8, 1)\times10^5\ \mathrm{kg\,m^2}$ \\
+$\vect{r}_T$ & thrust point & $(0,0,-12)$ m \\
+$\theta_{\max}$ & tilt limit & $70^\circ$ \\
+$\delta_{\max}$ & gimbal limit & $12^\circ$ \\
+$\gamma_{gs}$ & glide slope & $20^\circ$ \\
+$\omega_{\max}$ & body rate limit & $60^\circ$/s \\
+$K$ & SCvx nodes & $21$ (default) \\
+$w_\nu$ & virtual control weight & $10^3$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Donor vehicle constants used by the reconstruction}
+
+Taken from \code{external/booster-lander-simulator/core/constants.h}.
+
+\begin{center}
+\begin{tabular}{llr}
+\toprule
+symbol & meaning & value \\
+\midrule
+$L$ & vehicle length & $47.7$ m \\
+$R$ & radius & $1.83$ m \\
+$m_{\mathrm{dry}}$ & dry mass incl.\ legs and fins & $25\,600$ kg \\
+$z_{\mathrm{dry}}$ & dry centre of mass above base & $12.4$ m \\
+$A$ & tank column cross-section & $9.9\ \mathrm{m^2}$ \\
+$z_{\mathrm{base}}$ & column base & $1.6$ m \\
+$\rho$ & mixture density (assumed, $O/F=2.56$) & $1048\ \mathrm{kg/m^3}$ \\
+$T_{\mathrm{sl}}$ & engine thrust, sea level & $845$ kN \\
+$I_{sp}^{\mathrm{sl}}$, $I_{sp}^{\mathrm{vac}}$ & specific impulse & $282$, $311$ s \\
+$\delta_{\max}$ & gimbal limit & $5^\circ$ \\
+$n_f$, $S_f$, $C_{N\alpha}$, $\delta_f$ & fin pair, area, slope, deflection &
+  $2$, $2.4\ \mathrm{m^2}$, $3.0$/rad, $20^\circ$ \\
+$z_f$ & fin station & $45.0$ m \\
+$n_r$, $F_r$, $z_r$ & RCS couple, thrust, station & $2$, $500$ N, $40.5$ m \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Source map}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+section & implementation \\
+\midrule
+\ref{sec:vehicle} Vehicle model & \code{external/pdg/src/rocket.cpp} \\
+\ref{sec:guidance} Guidance & \code{external/pdg/src/scvx.cpp}, \code{lcvx.cpp}, \code{socp.cpp} \\
+\ref{sec:closedloop} Plant, autopilot & \code{external/pdg/src/sim.cpp} \\
+\ref{sec:closedloop} Feasibility screen & \code{bridge/pdg\_flight.cpp} \\
+\ref{sec:donor} Donor reconstruction & \code{bridge/bls\_flight.py} \\
+\ref{sec:projection} Projection, geometry & \code{viz/flight\_data.py} \\
+\ref{sec:projection} Camera & \code{viz/land2d\_mpl.py} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
